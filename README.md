@@ -1,7 +1,6 @@
 # OmniFrame
 
-# Image AI REST Gateway — Functional Specifications & Secure by Design
-
+# Image AI REST Gateway
 An API-first artificial intelligence gateway dedicated to image generation and transformation (text-to-image, image-to-image, etc.). It is built to support creative freedom, including erotic art and artistic nudity (lingerie, nude models), while enforcing strict access control, ephemeral data retention, and enterprise-grade application security.
 
 ---
@@ -63,8 +62,29 @@ Everything in the application revolves around the **REST API**. Any action perfo
 (UC-103: Provider Configuration)                         (UC-202: 24-hour View)
 (UC-104: TTL Extension)                                  (UC-203: Download)
 ```
-### Group 1: User Lifecycle & Authentication
+---
+## 5. Safe by Design — Content Governance
 
+### Principles
+* **Two layers:** an entitlement layer (who may request NSFW) and a content layer
+  (what may never be produced, for anyone, including administrators).
+* **Gateway-side enforcement:** all checks run in the REST API Gateway. Provider-side
+  moderation is treated as a bonus, never as a control.
+* **Fail closed:** if a moderation component is unavailable, NSFW requests are refused
+  (SFW requests may proceed with output checks only).
+* **Hard limits (non-overridable):**
+  1. No sexual or sexualized content involving minors or persons with a youthful
+     appearance, including fictional or stylized depictions.
+  2. No sexual or nude content depicting real, identifiable persons.
+
+### RBAC Addition
+| Attribute | Description |
+| :--- | :--- |
+| `nsfw_enabled` (per user, default `false`) | Granted only by an administrator. Requires MFA (TOTP) on the account, a recorded 18+ attestation and acceptance of the usage policy (timestamped). Revocable at any time. |
+
+---
+
+### Group 1: User Lifecycle & Authentication
 #### `UC-101`: Access Request & Registration via Single-Use Token
 * **Actors:** Visitor, Administrator, System (REST API Gateway).
 * **Preconditions:** Direct public registration endpoints are disabled.
@@ -121,3 +141,102 @@ Everything in the application revolves around the **REST API**. Any action perfo
   1. The administrator submits access tokens and configuration parameters for third-party APIs (Runware, Novita, Together AI, Replicate) via the administrative UI calling API endpoints.
   2. The administrator sets active statuses and priority sequence rankings for provider fallback order.
   3. The REST API encrypts API keys with **AES-256-GCM** before saving them to MariaDB.
+
+---
+
+### Group 4: Content Safety & Abuse Handling
+
+#### `UC-401`: NSFW Entitlement Grant
+* **Actor:** Administrator.
+* **Preconditions:** Target user is `active` and has TOTP enrolled.
+* **Main Flow:**
+  1. The administrator requests NSFW entitlement for a user via API.
+  2. On next login, the user must accept the usage policy and confirm they are 18+.
+  3. The API sets `nsfw_enabled = true` and logs grantor, timestamp and policy version.
+* **Exceptions:** Policy not accepted → entitlement remains pending; NSFW mode refused.
+
+#### `UC-402`: Pre-Generation Prompt Screening
+* **Actor:** System (REST API Gateway).
+* **Main Flow:**
+  1. Every generation request passes through a prompt screening stage
+     (normalization, denylist, then classifier).
+  2. The gateway rejects requests that match hard-limit categories (minor-related
+     terms, age indicators, real person names in NSFW context).
+  3. NSFW-mode requests from users without `nsfw_enabled` are rejected with 403.
+* **Exceptions:** Classifier unavailable → NSFW request refused (fail closed).
+
+#### `UC-403`: Image-to-Image Restrictions
+* **Actor:** System.
+* **Main Flow:**
+  1. Uploaded source images are re-encoded, stripped of metadata and size-bounded.
+  2. Image-to-image requests are forced to SFW mode. NSFW image-to-image is disabled
+     by design (no configuration flag can enable it).
+  3. If a face is detected in the source image, output screening (UC-404) applies
+     with the strictest thresholds.
+
+#### `UC-404`: Post-Generation Output Screening
+* **Actor:** System.
+* **Main Flow:**
+  1. Before writing to disk, each image is scored by a nudity classifier and an
+     apparent-age estimator.
+  2. Decision matrix:
+     - Nudity detected and user lacks `nsfw_enabled` → image discarded, request logged.
+     - Nudity or sexual content combined with youthful appearance → UC-406.
+     - Otherwise → normal flow (UC-201 step 5).
+* **Exceptions:** Screening unavailable → image discarded, user receives an error.
+
+### Screening Calibration (amends UC-404)
+* Thresholds are deliberately conservative: false positives (legitimate adult content
+  rejected) are an accepted cost; false negatives on hard limits are not.
+* Stylized content (anime, illustration) uses stricter age thresholds than photorealistic.
+* A rejected user sees a generic refusal message; the classifier scores are never
+  returned to the client (prevents threshold probing).
+
+#### `UC-405`: Provider Eligibility for NSFW
+* **Actor:** Administrator, System.
+* **Main Flow:**
+  1. Each provider carries an `nsfw_allowed` flag reflecting its terms of service.
+  2. NSFW requests are dispatched only along the subset of the fallback chain where
+     `nsfw_allowed = true`. A provider refusal is never retried elsewhere in a way
+     that bypasses gateway checks.
+
+#### `UC-406`: Critical Incident — Suspected Illegal Content
+* **Actor:** System, Administrator.
+* **Main Flow:**
+  1. The image is not served to the user. It is moved to an access-restricted
+     quarantine store, excluded from the 24h purge.
+  2. The account is suspended immediately and all active sessions are revoked.
+  3. Administrators are alerted. Quarantined content is reviewed only as strictly
+     necessary and reported to the competent authority (fedpol in Switzerland).
+  4. Quarantined content is deleted once authorities confirm it is no longer needed.
+
+#### `UC-407`: Repeated Violations
+* **Actor:** System, Administrator.
+* **Main Flow:**
+  1. Each rejected request (UC-402 / UC-404) increments a per-user violation counter.
+  2. Beyond a threshold within a sliding window, `nsfw_enabled` is revoked
+     automatically and the account is flagged for review.
+  3. The administrator reinstates, suspends or deletes the account.
+
+ #### `UC-408`: Usage Policy Versioning
+* **Actor:** System, User.
+* **Main Flow:**
+  1. The usage policy carries a version number stored in MariaDB.
+  2. Acceptance (user ID, policy version, timestamp) is recorded at registration
+     and at NSFW entitlement (UC-401).
+  3. When the policy version changes, users must re-accept before any further
+     generation request.
+     
+---
+
+# Abuse Audit Trail
+* Retained 12 months, independently of the 24h image retention.
+* Per request: user ID, timestamp, mode (SFW/NSFW), provider used, screening verdicts,
+  SHA-256 and perceptual hash of the output.
+* Prompt text stored in full only for rejected requests; accepted requests store
+  a hash only.
+* Access restricted to administrators; every access is itself logged.
+
+## Retention Override Restriction (amends UC-203)
+* "Keep indefinitely" applies only to the administrator's own images or to content
+  placed on hold under UC-406. It cannot be applied to other users' NSFW media.
